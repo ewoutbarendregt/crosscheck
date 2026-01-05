@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@azure/cosmos": "3.17.3",
     "fastify": "4.28.1",
     "jose": "5.6.3"
   },
