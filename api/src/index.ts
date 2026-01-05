@@ -1,8 +1,30 @@
 import Fastify from "fastify";
+import {
+  buildAuthConfigResponse,
+  buildAuthenticator,
+  loadAuthConfig,
+} from "./auth.js";
 
 const server = Fastify({ logger: true });
+const authConfig = loadAuthConfig();
+const authenticate = buildAuthenticator(authConfig);
 
 server.get("/health", async () => ({ status: "ok" }));
+
+server.get("/auth/config", async () => buildAuthConfigResponse(authConfig));
+
+server.get(
+  "/me",
+  {
+    preHandler: authenticate,
+  },
+  async (request) => ({
+    oid: request.user?.oid,
+    name: request.user?.name,
+    email: request.user?.email,
+    roles: request.user?.roles ?? [],
+  }),
+);
 
 const port = Number(process.env.PORT ?? 4000);
 
