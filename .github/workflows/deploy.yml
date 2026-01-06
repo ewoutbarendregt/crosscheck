@@ -1,0 +1,104 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+    env:
+      DEPLOY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      WEB_APP_NAME: ${{ vars.WEB_APP_NAME }}
+      API_APP_NAME: ${{ vars.API_APP_NAME }}
+      WORKER_APP_NAME: ${{ vars.WORKER_APP_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web
+        run: npm run build:web
+
+      - name: Build API
+        run: npm run build:api
+
+      - name: Build worker
+        run: npm run build:worker
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy infrastructure
+        run: |
+          az deployment group create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters @infra/params/${DEPLOY_ENV}.json
+
+      - name: Enable App Service build
+        run: |
+          az webapp config appsettings set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$WEB_APP_NAME" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+          az webapp config appsettings set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$API_APP_NAME" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+          az webapp config appsettings set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$WORKER_APP_NAME" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+
+      - name: Deploy web app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$WEB_APP_NAME" \
+            --src-path web \
+            --type zip
+
+      - name: Deploy API app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$API_APP_NAME" \
+            --src-path api \
+            --type zip
+
+      - name: Deploy worker app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$WORKER_APP_NAME" \
+            --src-path worker \
+            --type zip

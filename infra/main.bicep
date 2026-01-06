@@ -4,6 +4,8 @@ param environment string {
   allowed: [
     'enterprise'
     'public'
+    'staging'
+    'production'
   ]
 }
 param appServicePlanSku object = {
