@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "value": "crosscheck-prod"
+    },
+    "environment": {
+      "value": "enterprise"
+    },
+    "authConfig": {
+      "value": {
+        "clientId": "00000000-0000-0000-0000-000000000000",
+        "issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0",
+        "audience": "api://crosscheck-production"
+      }
+    },
+    "tenantIds": {
+      "value": [
+        "00000000-0000-0000-0000-000000000000"
+      ]
+    }
+  }
+}

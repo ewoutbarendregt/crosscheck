@@ -1,0 +1,101 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - environment: staging
+            param_file: infra/params/staging.json
+          - environment: production
+            param_file: infra/params/production.json
+    if: >
+      (github.event_name == 'push' && matrix.environment == 'staging') ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == matrix.environment)
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve deployment settings
+        id: settings
+        run: |
+          PARAM_FILE="${{ matrix.param_file }}"
+          NAME_PREFIX=$(jq -r '.parameters.namePrefix.value' "$PARAM_FILE")
+          echo "param_file=$PARAM_FILE" >> "$GITHUB_OUTPUT"
+          echo "name_prefix=$NAME_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "web_app=${NAME_PREFIX}-web" >> "$GITHUB_OUTPUT"
+          echo "api_app=${NAME_PREFIX}-api" >> "$GITHUB_OUTPUT"
+          echo "worker_app=${NAME_PREFIX}-worker" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy infrastructure
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters @"${{ steps.settings.outputs.param_file }}"
+
+      - name: Package apps
+        run: |
+          rm -f web.zip api.zip worker.zip
+          (cd web && zip -r ../web.zip . -x "node_modules/*")
+          (cd api && zip -r ../api.zip . -x "node_modules/*")
+          (cd worker && zip -r ../worker.zip . -x "node_modules/*")
+
+      - name: Enable Oryx builds
+        run: |
+          for app in "${{ steps.settings.outputs.web_app }}" "${{ steps.settings.outputs.api_app }}" "${{ steps.settings.outputs.worker_app }}"; do
+            az webapp config appsettings set \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name "$app" \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true ENABLE_ORYX_BUILD=true
+          done
+
+      - name: Deploy web app
+        run: |
+          az webapp deploy \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ steps.settings.outputs.web_app }}" \
+            --type zip \
+            --src-path web.zip
+
+      - name: Deploy api app
+        run: |
+          az webapp deploy \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ steps.settings.outputs.api_app }}" \
+            --type zip \
+            --src-path api.zip
+
+      - name: Deploy worker app
+        run: |
+          az webapp deploy \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ steps.settings.outputs.worker_app }}" \
+            --type zip \
+            --src-path worker.zip
