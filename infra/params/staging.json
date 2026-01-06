@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "value": "crosscheck-staging"
+    },
+    "environment": {
+      "value": "staging"
+    },
+    "authConfig": {
+      "value": {
+        "clientId": "33333333-3333-3333-3333-333333333333",
+        "issuer": "https://login.microsoftonline.com/33333333-3333-3333-3333-333333333333/v2.0",
+        "audience": "api://crosscheck-staging"
+      }
+    },
+    "tenantIds": {
+      "value": [
+        "33333333-3333-3333-3333-333333333333"
+      ]
+    }
+  }
+}
