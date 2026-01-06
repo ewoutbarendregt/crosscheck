@@ -1,0 +1,103 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ inputs.environment }}
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      APP_NAME_PREFIX: ${{ vars.APP_NAME_PREFIX }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web
+        run: npm run build:web
+
+      - name: Build api
+        run: npm run build:api
+
+      - name: Build worker
+        run: npm run build:worker
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Select deployment parameters
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "PARAM_FILE=infra/params/enterprise.json" >> "$GITHUB_ENV"
+          else
+            echo "PARAM_FILE=infra/params/public.json" >> "$GITHUB_ENV"
+          fi
+
+      - name: Deploy infrastructure
+        run: |
+          az deployment group create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters "@$PARAM_FILE" \
+            --parameters namePrefix="$APP_NAME_PREFIX"
+
+      - name: Package apps
+        run: |
+          rm -f web.zip api.zip worker.zip
+          (cd web && zip -r ../web.zip .)
+          (cd api && zip -r ../api.zip .)
+          (cd worker && zip -r ../worker.zip .)
+
+      - name: Deploy web app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "${APP_NAME_PREFIX}-web" \
+            --type zip \
+            --src-path web.zip
+
+      - name: Deploy api app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "${APP_NAME_PREFIX}-api" \
+            --type zip \
+            --src-path api.zip
+
+      - name: Deploy worker app
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "${APP_NAME_PREFIX}-worker" \
+            --type zip \
+            --src-path worker.zip
