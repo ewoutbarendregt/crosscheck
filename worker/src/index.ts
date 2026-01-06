@@ -1,5 +1,5 @@
 import { ServiceBusClient, type ServiceBusReceivedMessage } from "@azure/service-bus";
-import Ajv, { type JSONSchemaType } from "ajv";
+import Ajv, { type JSONSchemaType, type ValidateFunction } from "ajv";
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
@@ -308,9 +308,11 @@ const parseJson = (value: string, label: string) => {
   }
 };
 
-const ensureValid = <T>(validator: (data: unknown) => data is T, data: unknown, label: string): T => {
+const ensureValid = <T>(validator: ValidateFunction<T>, data: unknown, label: string): T => {
   if (!validator(data)) {
-    const errors = validator.errors?.map((error) => `${error.instancePath} ${error.message}`).join("; ");
+    const errors = validator.errors
+      ?.map((error) => `${error.instancePath} ${error.message}`)
+      .join("; ");
     throw new Error(`${label} failed schema validation: ${errors ?? "unknown error"}`);
   }
   return data;
