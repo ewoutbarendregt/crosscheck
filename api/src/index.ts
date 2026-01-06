@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { type ItemDefinition, type SqlParameter } from "@azure/cosmos";
 import Fastify, { type FastifyReply } from "fastify";
 import {
   buildAuthConfigResponse,
@@ -88,13 +89,15 @@ function parseNumber(value: unknown) {
   return undefined;
 }
 
-async function createItem<T extends { id: string; type: string }>(item: T) {
+type DomainItem = ItemDefinition & { id: string; type: string };
+
+async function createItem<T extends DomainItem>(item: T) {
   const container = await getDomainContainer();
   await container.items.create(item);
   return item;
 }
 
-async function readItem<T>(type: string, id: string) {
+async function readItem<T extends ItemDefinition>(type: string, id: string) {
   const container = await getDomainContainer();
   try {
     const { resource } = await container.item(id, type).read<T>();
@@ -108,13 +111,13 @@ async function readItem<T>(type: string, id: string) {
   }
 }
 
-async function replaceItem<T extends { id: string; type: string }>(item: T) {
+async function replaceItem<T extends DomainItem>(item: T) {
   const container = await getDomainContainer();
   await container.item(item.id, item.type).replace(item);
   return item;
 }
 
-async function queryItems<T>(query: string, parameters?: { name: string; value: unknown }[]) {
+async function queryItems<T extends ItemDefinition>(query: string, parameters?: SqlParameter[]) {
   const container = await getDomainContainer();
   const { resources } = await container.items
     .query<T>({ query, parameters })

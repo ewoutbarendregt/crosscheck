@@ -28,16 +28,15 @@ async function ensureContainer() {
     const client = getClient();
     initializedContainerPromise = client.databases
       .createIfNotExists({ id: DATABASE_ID })
-      .then((response) =>
-        response.database.containers.createIfNotExists({
+      .then(async ({ database }) => {
+        await database.containers.createIfNotExists({
           id: CONTAINER_ID,
           partitionKey: {
-            kind: "Hash",
             paths: ["/type"],
           },
-        }),
-      )
-      .then((response) => response.database);
+        });
+        return database;
+      });
   }
 
   return initializedContainerPromise;
