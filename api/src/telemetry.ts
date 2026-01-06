@@ -19,7 +19,7 @@ export function getTelemetryClient(): TelemetryClient {
     .setup(connectionString)
     .setAutoCollectDependencies(true)
     .setAutoCollectRequests(true)
-    .setAutoCollectPerformance(true)
+    .setAutoCollectPerformance(true, true)
     .setAutoCollectExceptions(true)
     .setAutoCollectConsole(false)
     .setAutoCollectHeartbeat(false)
