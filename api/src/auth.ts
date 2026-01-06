@@ -32,6 +32,7 @@ export interface AuthConfig {
 }
 
 export interface AuthenticatedUser {
+  tenantId?: string;
   oid?: string;
   name?: string;
   email?: string;
@@ -163,6 +164,7 @@ export function buildAuthenticator(config: AuthConfig) {
       }
 
       request.user = {
+        tenantId: stringValue(payload.tid ?? payload.tenantId),
         oid: stringValue(payload.oid),
         name: stringValue(payload.name),
         email: stringValue(payload.preferred_username ?? payload.email),
