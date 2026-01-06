@@ -1,0 +1,115 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+    env:
+      DEPLOY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
+      BICEP_PARAMETERS_FILE: ${{ (github.event_name == 'workflow_dispatch' && inputs.environment || 'staging') == 'production' && 'infra/params/enterprise.json' || 'infra/params/public.json' }}
+      WEB_APP_NAME: ${{ vars.WEB_APP_NAME || '' }}
+      API_APP_NAME: ${{ vars.API_APP_NAME || '' }}
+      WORKER_APP_NAME: ${{ vars.WORKER_APP_NAME || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web
+        run: npm run build:web
+
+      - name: Build api
+        run: npm run build:api
+
+      - name: Build worker
+        run: npm run build:worker
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group
+        run: az group create --name "$RESOURCE_GROUP" --location "$AZURE_LOCATION"
+
+      - name: Deploy infrastructure
+        run: |
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters "@${BICEP_PARAMETERS_FILE}"
+
+      - name: Package web app
+        if: env.WEB_APP_NAME != ''
+        run: |
+          rm -f web.zip
+          zip -r web.zip web
+
+      - name: Deploy web app
+        if: env.WEB_APP_NAME != ''
+        run: |
+          az webapp deploy \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEB_APP_NAME" \
+            --src-path web.zip
+
+      - name: Package api app
+        if: env.API_APP_NAME != ''
+        run: |
+          rm -f api.zip
+          zip -r api.zip api
+
+      - name: Deploy api app
+        if: env.API_APP_NAME != ''
+        run: |
+          az webapp deploy \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$API_APP_NAME" \
+            --src-path api.zip
+
+      - name: Package worker app
+        if: env.WORKER_APP_NAME != ''
+        run: |
+          rm -f worker.zip
+          zip -r worker.zip worker
+
+      - name: Deploy worker app
+        if: env.WORKER_APP_NAME != ''
+        run: |
+          az webapp deploy \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WORKER_APP_NAME" \
+            --src-path worker.zip
