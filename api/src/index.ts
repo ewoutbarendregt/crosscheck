@@ -11,12 +11,23 @@ import {
   type ContextualMemory,
   type CriteriaFramework,
   type Criterion,
+  type Document,
+  type DocumentExtraction,
   type Finding,
   type Run,
   type Standard,
   type StandardVersion,
   nowIso,
 } from "./models.js";
+import {
+  buildExtractionRecord,
+  computeSha256,
+  extractWithDocumentIntelligence,
+  extractWithVisionFallback,
+  getDocumentIntelligenceVersion,
+  getVisionVersion,
+  uploadDocumentBlob,
+} from "./ingestion.js";
 
 const server = Fastify({ logger: true });
 const authConfig = loadAuthConfig();
@@ -91,6 +102,17 @@ async function queryItems<T>(query: string, parameters?: { name: string; value: 
     .query<T>({ query, parameters })
     .fetchAll();
   return resources;
+}
+
+async function findExtractionByHash(hash: string, version: string) {
+  const results = await queryItems<DocumentExtraction>(
+    "SELECT * FROM c WHERE c.type = 'documentExtraction' AND c.hash = @hash AND c.version = @version",
+    [
+      { name: "@hash", value: hash },
+      { name: "@version", value: version },
+    ],
+  );
+  return results[0] ?? null;
 }
 
 function badRequest(reply: FastifyReply, message: string) {
@@ -706,6 +728,163 @@ server.get("/findings/:findingId", secured, async (request) => {
     "SELECT * FROM c WHERE c.type = 'finding' AND c.findingId = @findingId ORDER BY c.version DESC",
     [{ name: "@findingId", value: findingId }],
   );
+});
+
+server.post("/documents/ingest", secured, async (request, reply) => {
+  try {
+    const body = request.body as Record<string, unknown>;
+    const fileName = requiredString(body.fileName, "fileName");
+    const contentBase64 = requiredString(body.contentBase64, "contentBase64");
+    const contentType = optionalString(body.contentType) ?? "application/octet-stream";
+    const allowFallback = Boolean(body.allowFallback);
+
+    const buffer = Buffer.from(contentBase64, "base64");
+    if (!buffer.length) {
+      return badRequest(reply, "contentBase64 is empty");
+    }
+
+    const sha256 = computeSha256(buffer);
+    const { blobUrl } = await uploadDocumentBlob({
+      data: buffer,
+      fileName,
+      contentType,
+    });
+
+    const now = nowIso();
+    const document: Document = {
+      id: randomUUID(),
+      type: "document",
+      fileName,
+      contentType,
+      sizeBytes: buffer.length,
+      sha256,
+      blobUrl,
+      status: "uploaded",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await createItem(document);
+
+    const { version: diVersion } = getDocumentIntelligenceVersion();
+    const cachedDi = await findExtractionByHash(sha256, diVersion);
+
+    const applyExtraction = async (extraction: DocumentExtraction) => {
+      const updated: Document = {
+        ...document,
+        status: "extracted",
+        extractionId: extraction.id,
+        extractionVersion: extraction.version,
+        fallbackUsed: extraction.fallbackUsed,
+        updatedAt: nowIso(),
+      };
+      await replaceItem(updated);
+      return updated;
+    };
+
+    if (cachedDi) {
+      const updated = await applyExtraction(cachedDi);
+      return { document: updated, extraction: cachedDi, cached: true };
+    }
+
+    try {
+      const diResult = await extractWithDocumentIntelligence(buffer);
+      const extraction = buildExtractionRecord({
+        hash: sha256,
+        version: diResult.version,
+        extractedText: diResult.extractedText,
+        fallbackUsed: false,
+        source: diResult.source,
+      });
+      await createItem(extraction);
+      const updated = await applyExtraction(extraction);
+      return { document: updated, extraction, cached: false };
+    } catch (error) {
+      if (!allowFallback) {
+        const updated: Document = {
+          ...document,
+          status: "failed",
+          extractionError: (error as Error).message,
+          updatedAt: nowIso(),
+        };
+        await replaceItem(updated);
+        reply.code(502);
+        return reply.send({
+          error: "Document Intelligence extraction failed; fallback not attempted.",
+          details: updated.extractionError,
+        });
+      }
+
+      const visionVersion = getVisionVersion();
+      if (!visionVersion) {
+        const updated: Document = {
+          ...document,
+          status: "failed",
+          extractionError: "LLM vision fallback is not configured",
+          updatedAt: nowIso(),
+        };
+        await replaceItem(updated);
+        reply.code(502);
+        return reply.send({
+          error: "Document Intelligence extraction failed; fallback unavailable.",
+          details: updated.extractionError,
+        });
+      }
+
+      const cachedVision = await findExtractionByHash(sha256, visionVersion);
+      if (cachedVision) {
+        const updated = await applyExtraction(cachedVision);
+        return { document: updated, extraction: cachedVision, cached: true };
+      }
+
+      try {
+        const fallbackResult = await extractWithVisionFallback({
+          buffer,
+          contentType,
+          fileName,
+        });
+        const extraction = buildExtractionRecord({
+          hash: sha256,
+          version: fallbackResult.version,
+          extractedText: fallbackResult.extractedText,
+          fallbackUsed: true,
+          source: fallbackResult.source,
+        });
+        await createItem(extraction);
+        const updated = await applyExtraction(extraction);
+        return {
+          document: updated,
+          extraction,
+          cached: false,
+          fallbackUsed: true,
+        };
+      } catch (fallbackError) {
+        const updated: Document = {
+          ...document,
+          status: "failed",
+          extractionError: (fallbackError as Error).message,
+          updatedAt: nowIso(),
+        };
+        await replaceItem(updated);
+        reply.code(502);
+        return reply.send({
+          error: "Document Intelligence extraction failed; fallback failed.",
+          details: updated.extractionError,
+        });
+      }
+    }
+  } catch (error) {
+    return badRequest(reply, (error as Error).message);
+  }
+});
+
+server.get("/documents/:id", secured, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const document = await readItem<Document>("document", id);
+  if (!document) {
+    return notFound(reply, "Document not found");
+  }
+  return document;
 });
 
 server.put("/findings/:findingId", secured, async (request, reply) => {

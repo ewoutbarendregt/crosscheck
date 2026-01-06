@@ -6,7 +6,9 @@ export type DomainType =
   | "criterion"
   | "contextualMemory"
   | "run"
-  | "finding";
+  | "finding"
+  | "document"
+  | "documentExtraction";
 
 export interface DomainRecord {
   id: string;
@@ -101,6 +103,30 @@ export interface Finding extends DomainRecord {
   status: "open" | "resolved" | "dismissed";
   evidence?: string;
   notes?: string;
+}
+
+export interface Document extends DomainRecord {
+  type: "document";
+  fileName: string;
+  contentType?: string;
+  sizeBytes: number;
+  sha256: string;
+  blobUrl: string;
+  status: "uploaded" | "extracted" | "failed";
+  extractionId?: string;
+  extractionVersion?: string;
+  fallbackUsed?: boolean;
+  extractionError?: string;
+}
+
+export interface DocumentExtraction extends DomainRecord {
+  type: "documentExtraction";
+  hash: string;
+  version: string;
+  extractedText: string;
+  fallbackUsed: boolean;
+  source: "document-intelligence" | "llm-vision";
+  extractedAt: string;
 }
 
 export function nowIso() {
