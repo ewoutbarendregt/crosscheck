@@ -63,6 +63,24 @@ function optionalString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function isStandardContext(value: unknown): value is Standard["context"] {
+  return value === "general" || value === "recruitment";
+}
+
+function suggestStandardContext(name: string, description?: string): Standard["context"] {
+  const haystack = `${name} ${description ?? ""}`.toLowerCase();
+  if (
+    haystack.includes("recruitment") ||
+    haystack.includes("hiring") ||
+    haystack.includes("employment") ||
+    haystack.includes("candidate") ||
+    haystack.includes("job")
+  ) {
+    return "recruitment";
+  }
+  return "general";
+}
+
 function parseNumber(value: unknown) {
   if (typeof value === "number" && !Number.isNaN(value)) {
     return value;
@@ -130,6 +148,23 @@ function conflict(reply: FastifyReply, message: string) {
   return reply.send({ error: message });
 }
 
+function requireHumanActor(request: { user?: { oid?: string; email?: string } }) {
+  return request.user?.oid ?? request.user?.email ?? null;
+}
+
+function logRecruitmentEvent(event: string, details: Record<string, unknown>) {
+  server.log.info({ event, ...details }, "Recruitment compliance event");
+}
+
+async function readStandardByVersion(standardVersionId: string) {
+  const standardVersion = await readItem<StandardVersion>("standardVersion", standardVersionId);
+  if (!standardVersion) {
+    return { standard: null, standardVersion: null };
+  }
+  const standard = await readItem<Standard>("standard", standardVersion.standardId);
+  return { standard, standardVersion };
+}
+
 async function triggerReapprovalForFramework(frameworkId: string, reason: string) {
   const criteria = await queryItems<Criterion>(
     "SELECT * FROM c WHERE c.type = 'criterion' AND c.frameworkId = @frameworkId AND c.approval.status = 'approved'",
@@ -185,16 +220,47 @@ server.post("/standards", secured, async (request, reply) => {
     const body = request.body as Record<string, unknown>;
     const name = requiredString(body.name, "name");
     const description = optionalString(body.description);
+    const context = isStandardContext(body.context) ? body.context : undefined;
+    if (!context) {
+      reply.code(400);
+      return reply.send({
+        error: "Missing or invalid context",
+        suggestedContext: suggestStandardContext(name, description),
+      });
+    }
+    const contextConfirmed = Boolean(body.contextConfirmed);
+    const contextSuggestion = suggestStandardContext(name, description);
+    if (!contextConfirmed) {
+      reply.code(409);
+      return reply.send({
+        error: "Context confirmation required",
+        suggestedContext: contextSuggestion,
+        providedContext: context,
+      });
+    }
     const now = nowIso();
     const standard: Standard = {
       id: randomUUID(),
       type: "standard",
       name,
       description,
+      context,
+      contextSuggestion,
+      contextConfirmed,
+      contextConfirmedAt: now,
+      contextConfirmedBy: requireHumanActor(request) ?? "unknown",
       createdAt: now,
       updatedAt: now,
     };
     await createItem(standard);
+    if (context === "recruitment") {
+      logRecruitmentEvent("standard_created", {
+        standardId: standard.id,
+        name: standard.name,
+        contextSuggestion,
+        confirmedBy: standard.contextConfirmedBy,
+      });
+    }
     return standard;
   } catch (error) {
     return badRequest(reply, (error as Error).message);
@@ -208,6 +274,45 @@ server.get("/standards/:id", secured, async (request, reply) => {
     return notFound(reply, "Standard not found");
   }
   return standard;
+});
+
+server.get("/standards/:id/disclosure-templates", secured, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const standard = await readItem<Standard>("standard", id);
+  if (!standard) {
+    return notFound(reply, "Standard not found");
+  }
+  if (standard.context !== "recruitment") {
+    return conflict(reply, "Disclosure templates are only available for recruitment context");
+  }
+
+  const templates = [
+    {
+      id: "eu-ai-act-recruitment-notice",
+      title: "EU AI Act Recruitment Transparency Notice",
+      body:
+        "This recruitment process uses AI-assisted evaluation tools. A qualified human reviewer " +
+        "oversees decisions, and applicants can request information about the AI system's role.",
+    },
+    {
+      id: "candidate-rights-summary",
+      title: "Candidate Rights Summary",
+      body:
+        "Applicants may request human review, contest decisions, and receive information about " +
+        "the data categories used in automated assessments.",
+    },
+  ];
+
+  logRecruitmentEvent("disclosure_templates_exported", {
+    standardId: standard.id,
+    exportedAt: nowIso(),
+  });
+
+  return {
+    standardId: standard.id,
+    generatedAt: nowIso(),
+    templates,
+  };
 });
 
 server.post("/standards/:id/versions", secured, async (request, reply) => {
@@ -582,6 +687,11 @@ server.post("/criteria/:id/approve", secured, async (request, reply) => {
     return conflict(reply, "Criterion is not pending approval");
   }
 
+  const approvedBy = requireHumanActor(request);
+  if (!approvedBy) {
+    return conflict(reply, "Human-in-the-loop required for approvals");
+  }
+
   const now = nowIso();
   const updated: Criterion = {
     ...criterion,
@@ -590,7 +700,7 @@ server.post("/criteria/:id/approve", secured, async (request, reply) => {
       status: "approved",
       submittedBy: criterion.approval.submittedBy,
       submittedAt: criterion.approval.submittedAt,
-      approvedBy: request.user?.oid ?? request.user?.email ?? "system",
+      approvedBy,
       approvedAt: now,
     },
   };
@@ -612,6 +722,10 @@ server.post("/criteria/:id/reject", secured, async (request, reply) => {
 
   const body = request.body as Record<string, unknown>;
   const reason = optionalString(body.reason);
+  const rejectedBy = requireHumanActor(request);
+  if (!rejectedBy) {
+    return conflict(reply, "Human-in-the-loop required for rejections");
+  }
   const now = nowIso();
   const updated: Criterion = {
     ...criterion,
@@ -620,7 +734,7 @@ server.post("/criteria/:id/reject", secured, async (request, reply) => {
       status: "rejected",
       submittedBy: criterion.approval.submittedBy,
       submittedAt: criterion.approval.submittedAt,
-      rejectedBy: request.user?.oid ?? request.user?.email ?? "system",
+      rejectedBy,
       rejectedAt: now,
       rejectionReason: reason,
     },
@@ -653,6 +767,16 @@ server.post("/runs", secured, async (request, reply) => {
     };
 
     await createItem(run);
+    const { standard } = await readStandardByVersion(standardVersionId);
+    if (standard?.context === "recruitment") {
+      logRecruitmentEvent("run_started", {
+        runId: run.id,
+        standardId: standard.id,
+        standardVersionId,
+        frameworkId,
+        initiatedBy: requireHumanActor(request) ?? "unknown",
+      });
+    }
     return run;
   } catch (error) {
     return badRequest(reply, (error as Error).message);
@@ -687,6 +811,62 @@ server.put("/runs/:id", secured, async (request, reply) => {
   } catch (error) {
     return badRequest(reply, (error as Error).message);
   }
+});
+
+server.get("/runs/:id/bias-diagnostics", secured, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const run = await readItem<Run>("run", id);
+  if (!run) {
+    return notFound(reply, "Run not found");
+  }
+
+  const { standard } = await readStandardByVersion(run.standardVersionId);
+  if (!standard) {
+    return notFound(reply, "Standard not found");
+  }
+
+  if (standard.context !== "recruitment") {
+    return conflict(reply, "Bias diagnostics are only available for recruitment context");
+  }
+
+  const findings = await queryItems<Finding>(
+    "SELECT * FROM c WHERE c.type = 'finding' AND c.runId = @runId",
+    [{ name: "@runId", value: run.id }],
+  );
+
+  const latestByFinding = new Map<string, Finding>();
+  for (const finding of findings) {
+    const current = latestByFinding.get(finding.findingId);
+    if (!current || finding.version > current.version) {
+      latestByFinding.set(finding.findingId, finding);
+    }
+  }
+
+  const aggregates = {
+    totalFindings: latestByFinding.size,
+    statusCounts: {
+      open: 0,
+      resolved: 0,
+      dismissed: 0,
+    },
+  };
+
+  for (const finding of latestByFinding.values()) {
+    aggregates.statusCounts[finding.status] += 1;
+  }
+
+  logRecruitmentEvent("bias_diagnostics_requested", {
+    runId: run.id,
+    standardId: standard.id,
+    totalFindings: aggregates.totalFindings,
+  });
+
+  return {
+    runId: run.id,
+    standardId: standard.id,
+    generatedAt: nowIso(),
+    aggregates,
+  };
 });
 
 server.post("/runs/:runId/findings", secured, async (request, reply) => {

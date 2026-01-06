@@ -22,6 +22,11 @@ export interface Standard extends DomainRecord {
   name: string;
   description?: string;
   currentVersionId?: string;
+  context: "general" | "recruitment";
+  contextSuggestion: "general" | "recruitment";
+  contextConfirmed: boolean;
+  contextConfirmedAt?: string;
+  contextConfirmedBy?: string;
 }
 
 export interface StandardVersion extends DomainRecord {
