@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type ItemDefinition, type SqlParameter } from "@azure/cosmos";
+import { ServiceBusClient } from "@azure/service-bus";
 import Fastify, { type FastifyReply } from "fastify";
 import {
   buildAuthConfigResponse,
@@ -29,10 +30,31 @@ import {
   getVisionVersion,
   uploadDocumentBlob,
 } from "./ingestion.js";
+import {
+  QueueDepthError,
+  ReasoningQueue,
+  TenantQuotaError,
+  parseTenantQuotas,
+} from "./queue.js";
+import { getTelemetryClient } from "./telemetry.js";
 
 const server = Fastify({ logger: true });
 const authConfig = loadAuthConfig();
 const authenticate = buildAuthenticator(authConfig);
+const telemetry = getTelemetryClient();
+
+const reasoningQueueDepthLimit = Number(
+  process.env.REASONING_QUEUE_DEPTH_LIMIT ?? 50,
+);
+const reasoningDispatchConcurrency = Number(
+  process.env.REASONING_DISPATCH_CONCURRENCY ?? 2,
+);
+const defaultTenantQuota = Number(process.env.TENANT_DEFAULT_QUOTA ?? 5);
+const tenantQuotas = parseTenantQuotas(
+  process.env.TENANT_HARD_QUOTAS_JSON,
+);
+let reasoningQueue: ReasoningQueue | null = null;
+let reasoningQueueClient: ServiceBusClient | null = null;
 
 server.get("/health", async () => ({ status: "ok" }));
 
@@ -153,6 +175,45 @@ function conflict(reply: FastifyReply, message: string) {
 
 function requireHumanActor(request: { user?: { oid?: string; email?: string } }) {
   return request.user?.oid ?? request.user?.email ?? null;
+}
+
+function requireAdmin(request: { user?: { roles?: string[] } }) {
+  return request.user?.roles?.includes("admin") ?? false;
+}
+
+function resolveTenantId(request: { user?: { tenantId?: string; oid?: string }; headers: Record<string, unknown> }) {
+  const header = request.headers["x-tenant-id"];
+  if (typeof header === "string" && header.trim()) {
+    return header.trim();
+  }
+  return request.user?.tenantId ?? request.user?.oid ?? null;
+}
+
+function getReasoningQueue() {
+  if (reasoningQueue) {
+    return reasoningQueue;
+  }
+
+  const connectionString = process.env.SERVICE_BUS_CONNECTION_STRING;
+  const queueName = process.env.REASONING_QUEUE_NAME;
+  if (!connectionString || !queueName) {
+    return null;
+  }
+
+  reasoningQueueClient = reasoningQueueClient ?? new ServiceBusClient(connectionString);
+  const sender = reasoningQueueClient.createSender(queueName);
+  reasoningQueue = new ReasoningQueue(
+    sender,
+    {
+      maxQueueDepth: reasoningQueueDepthLimit,
+      maxDispatchInFlight: reasoningDispatchConcurrency,
+      defaultTenantQuota,
+      tenantQuotas,
+    },
+    telemetry,
+  );
+
+  return reasoningQueue;
 }
 
 function logRecruitmentEvent(event: string, details: Record<string, unknown>) {
@@ -745,6 +806,131 @@ server.post("/criteria/:id/reject", secured, async (request, reply) => {
 
   await replaceItem(updated);
   return updated;
+});
+
+server.post("/reasoning/jobs", secured, async (request, reply) => {
+  try {
+    const body = request.body as Record<string, unknown>;
+    const claim = requiredString(body.claim, "claim");
+    const context = body.context as { documents?: Array<Record<string, unknown>> };
+    const criteria = body.criteria as Array<Record<string, unknown>> | undefined;
+    const tenantId = resolveTenantId(request);
+
+    if (!tenantId) {
+      return badRequest(reply, "Missing tenantId");
+    }
+
+    if (!context?.documents?.length) {
+      return badRequest(reply, "context.documents is required");
+    }
+    if (!criteria?.length) {
+      return badRequest(reply, "criteria is required");
+    }
+
+    const documents = context.documents.map((document, index) => ({
+      id: requiredString(document.id, `context.documents[${index}].id`),
+      content: requiredString(document.content, `context.documents[${index}].content`),
+    }));
+    const parsedCriteria = criteria.map((criterion, index) => ({
+      id: requiredString(criterion.id, `criteria[${index}].id`),
+      description: requiredString(criterion.description, `criteria[${index}].description`),
+    }));
+
+    const queue = getReasoningQueue();
+    if (!queue) {
+      reply.code(503);
+      return reply.send({ error: "Reasoning queue is not configured" });
+    }
+
+    const job = {
+      jobId: randomUUID(),
+      tenantId,
+      claim,
+      context: { documents },
+      criteria: parsedCriteria,
+    };
+
+    const queued = queue.enqueue(job);
+    return {
+      jobId: job.jobId,
+      status: "queued",
+      queueDepth: queued.queueDepth,
+      position: queued.position,
+      quota: queued.quota,
+      usage: queued.usage,
+    };
+  } catch (error) {
+    if (error instanceof TenantQuotaError) {
+      reply.code(429);
+      return reply.send({
+        error: {
+          code: error.code,
+          message: error.message,
+          tenantId: error.tenantId,
+          quota: error.quota,
+          usage: error.usage,
+        },
+      });
+    }
+    if (error instanceof QueueDepthError) {
+      reply.code(429);
+      return reply.send({
+        error: {
+          code: error.code,
+          message: error.message,
+          queueDepth: error.queueDepth,
+          limit: error.limit,
+        },
+      });
+    }
+    return badRequest(reply, (error as Error).message);
+  }
+});
+
+server.get("/admin/usage", secured, async (request, reply) => {
+  if (!requireAdmin(request)) {
+    reply.code(403);
+    return reply.send({ error: "Admin role required" });
+  }
+
+  const queue = getReasoningQueue();
+  if (!queue) {
+    reply.code(503);
+    return reply.send({ error: "Reasoning queue is not configured" });
+  }
+
+  return queue.getUsageSnapshot();
+});
+
+server.post("/admin/usage/events", async (request, reply) => {
+  const secret = process.env.USAGE_EVENT_SECRET;
+  if (secret) {
+    const header = request.headers["x-usage-secret"];
+    if (header !== secret) {
+      reply.code(401);
+      return reply.send({ error: "Invalid usage event secret" });
+    }
+  }
+
+  try {
+    const body = request.body as Record<string, unknown>;
+    const tenantId = requiredString(body.tenantId, "tenantId");
+    const type = requiredString(body.type, "type");
+    if (!["started", "completed", "failed", "rejected"].includes(type)) {
+      return badRequest(reply, "type must be started, completed, failed, or rejected");
+    }
+
+    const queue = getReasoningQueue();
+    if (!queue) {
+      reply.code(503);
+      return reply.send({ error: "Reasoning queue is not configured" });
+    }
+
+    queue.recordUsageEvent({ tenantId, type: type as "started" | "completed" | "failed" | "rejected" });
+    return { status: "ok" };
+  } catch (error) {
+    return badRequest(reply, (error as Error).message);
+  }
 });
 
 server.post("/runs", secured, async (request, reply) => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 const matrixData = [
   { category: "Identity", scores: [5, 3, 4, 2, 1] },
@@ -12,8 +12,44 @@ const matrixData = [
 
 const documents = ["Doc A", "Doc B", "Doc C", "Doc D", "Doc E"];
 
+interface UsageSnapshot {
+  queueDepth: number;
+  maxQueueDepth: number;
+  tenants: Array<{
+    tenantId: string;
+    queued: number;
+    active: number;
+    quota: number;
+  }>;
+}
+
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
+
 export default function Workspace() {
   const [showExplanation, setShowExplanation] = useState(false);
+  const [usageSnapshot, setUsageSnapshot] = useState<UsageSnapshot | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [usageLoading, setUsageLoading] = useState(true);
+
+  useEffect(() => {
+    const loadUsage = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/admin/usage`);
+        if (!response.ok) {
+          throw new Error(`Usage request failed (${response.status})`);
+        }
+        const data = (await response.json()) as UsageSnapshot;
+        setUsageSnapshot(data);
+      } catch (error) {
+        setUsageError(error instanceof Error ? error.message : "Unable to load usage data");
+      } finally {
+        setUsageLoading(false);
+      }
+    };
+
+    void loadUsage();
+  }, []);
 
   const matrixMax = useMemo(
     () => Math.max(...matrixData.flatMap((row) => row.scores)),
@@ -91,6 +127,59 @@ export default function Workspace() {
                 </div>
               ))}
             </div>
+          </section>
+
+          <section style={styles.card}>
+            <header style={styles.cardHeader}>
+              <div>
+                <h2 style={styles.cardTitle}>Admin usage dashboard</h2>
+                <p style={styles.cardSubtitle}>
+                  Monitor per-tenant quotas, active workloads, and queue pressure.
+                </p>
+              </div>
+            </header>
+            {usageLoading ? (
+              <p style={styles.mutedText}>Loading usage metrics…</p>
+            ) : usageError ? (
+              <p style={styles.errorText}>{usageError}</p>
+            ) : usageSnapshot ? (
+              <div>
+                <div style={styles.usageSummary}>
+                  <div>
+                    <p style={styles.statLabel}>Queue depth</p>
+                    <p style={styles.statValue}>
+                      {usageSnapshot.queueDepth} / {usageSnapshot.maxQueueDepth}
+                    </p>
+                  </div>
+                  <div>
+                    <p style={styles.statLabel}>Tracked tenants</p>
+                    <p style={styles.statValue}>{usageSnapshot.tenants.length}</p>
+                  </div>
+                </div>
+                <div style={styles.usageTable}>
+                  <div style={styles.usageHeader}>
+                    <span>Tenant</span>
+                    <span>Queued</span>
+                    <span>Active</span>
+                    <span>Quota</span>
+                  </div>
+                  {usageSnapshot.tenants.length === 0 ? (
+                    <p style={styles.mutedText}>No tenant activity yet.</p>
+                  ) : (
+                    usageSnapshot.tenants.map((tenant) => (
+                      <div key={tenant.tenantId} style={styles.usageRow}>
+                        <span style={styles.usageTenant}>{tenant.tenantId}</span>
+                        <span>{tenant.queued}</span>
+                        <span>{tenant.active}</span>
+                        <span>{tenant.quota}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p style={styles.mutedText}>Usage data unavailable.</p>
+            )}
           </section>
 
           <section style={styles.card}>
@@ -491,6 +580,46 @@ const styles = {
     margin: "8px 0 0",
     fontSize: "1.4rem",
     fontWeight: 600,
+  },
+  usageSummary: {
+    display: "flex",
+    gap: "32px",
+    marginBottom: "16px",
+  },
+  usageTable: {
+    display: "grid",
+    gap: "10px",
+  },
+  usageHeader: {
+    display: "grid",
+    gridTemplateColumns: "2fr repeat(3, 1fr)",
+    fontSize: "0.8rem",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.08em",
+    color: "#6b7280",
+  },
+  usageRow: {
+    display: "grid",
+    gridTemplateColumns: "2fr repeat(3, 1fr)",
+    padding: "10px 12px",
+    borderRadius: "12px",
+    border: "1px solid #e5e7eb",
+    background: "#f9fafb",
+    fontSize: "0.9rem",
+  },
+  usageTenant: {
+    fontWeight: 600,
+    color: "#111827",
+  },
+  mutedText: {
+    margin: 0,
+    color: "#6b7280",
+    fontSize: "0.9rem",
+  },
+  errorText: {
+    margin: 0,
+    color: "#b91c1c",
+    fontSize: "0.9rem",
   },
   criteriaList: {
     display: "grid",

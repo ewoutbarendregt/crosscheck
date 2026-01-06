@@ -1,5 +1,6 @@
 import { ServiceBusClient, type ServiceBusReceivedMessage } from "@azure/service-bus";
 import Ajv, { type JSONSchemaType, type ValidateFunction } from "ajv";
+import { getTelemetryClient } from "./telemetry.js";
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
@@ -17,9 +18,16 @@ const foundryApiKey = requiredEnv("AZURE_AI_FOUNDRY_API_KEY");
 const foundryDeployment = requiredEnv("AZURE_AI_FOUNDRY_DEPLOYMENT");
 const foundryApiVersion = process.env.AZURE_AI_FOUNDRY_API_VERSION ?? "2024-02-15-preview";
 const maxConcurrentCalls = Number(process.env.REASONING_CONCURRENCY ?? 4);
+const maxQueueDepth = Number(process.env.REASONING_QUEUE_DEPTH ?? 50);
+const defaultTenantQuota = Number(process.env.TENANT_DEFAULT_QUOTA ?? 5);
+const tenantQuotas = parseTenantQuotas(process.env.TENANT_HARD_QUOTAS_JSON);
+const usageEventEndpoint = process.env.USAGE_EVENT_ENDPOINT ?? "";
+const usageEventSecret = process.env.USAGE_EVENT_SECRET ?? "";
+const telemetry = getTelemetryClient();
 
 interface ReasoningJob {
   jobId: string;
+  tenantId: string;
   claim: string;
   context: {
     documents: Array<{ id: string; content: string }>;
@@ -86,10 +94,80 @@ interface PipelineResult {
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 
+const tenantActiveCounts = new Map<string, number>();
+const pendingMessages: ServiceBusReceivedMessage[] = [];
+let activeWorkers = 0;
+
+function parseTenantQuotas(value?: string) {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as Record<string, number>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, quota]) => typeof quota === "number" && quota > 0),
+    );
+  } catch (error) {
+    console.warn("Failed to parse TENANT_HARD_QUOTAS_JSON", error);
+    return {};
+  }
+}
+
+function getTenantQuota(tenantId: string) {
+  return tenantQuotas[tenantId] ?? defaultTenantQuota;
+}
+
+function getTenantCount(tenantId: string) {
+  return tenantActiveCounts.get(tenantId) ?? 0;
+}
+
+function updateTenantCount(tenantId: string, delta: number) {
+  const next = Math.max(0, getTenantCount(tenantId) + delta);
+  if (next === 0) {
+    tenantActiveCounts.delete(tenantId);
+  } else {
+    tenantActiveCounts.set(tenantId, next);
+  }
+}
+
+function trackMetric(name: string, value: number, properties?: Record<string, string>) {
+  if (!telemetry) {
+    return;
+  }
+  telemetry.trackMetric({ name, value, properties });
+}
+
+function trackEvent(name: string, properties?: Record<string, string>) {
+  if (!telemetry) {
+    return;
+  }
+  telemetry.trackEvent({ name, properties });
+}
+
+async function emitUsageEvent(payload: { tenantId: string; type: string }) {
+  if (!usageEventEndpoint) {
+    return;
+  }
+
+  try {
+    await fetch(usageEventEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(usageEventSecret ? { "x-usage-secret": usageEventSecret } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    console.warn("Failed to emit usage event", error);
+  }
+}
+
 const jobSchema: JSONSchemaType<ReasoningJob> = {
   type: "object",
   properties: {
     jobId: { type: "string" },
+    tenantId: { type: "string" },
     claim: { type: "string" },
     context: {
       type: "object",
@@ -125,7 +203,7 @@ const jobSchema: JSONSchemaType<ReasoningJob> = {
       minItems: 1,
     },
   },
-  required: ["jobId", "claim", "context", "criteria"],
+  required: ["jobId", "tenantId", "claim", "context", "criteria"],
   additionalProperties: false,
 };
 
@@ -443,6 +521,110 @@ const decodeJob = (message: ServiceBusReceivedMessage): ReasoningJob => {
   return ensureValid(validateJob, body, "Job");
 };
 
+const processQueuedMessage = async (
+  message: ServiceBusReceivedMessage,
+  receiver: ReturnType<ServiceBusClient["createReceiver"]>,
+  sender: ReturnType<ServiceBusClient["createSender"]>,
+) => {
+  const job = decodeJob(message);
+  const tenantId = job.tenantId;
+  const quota = getTenantQuota(tenantId);
+  const current = getTenantCount(tenantId);
+
+  if (current >= quota) {
+    const errorMessage = `Tenant ${tenantId} exceeded quota of ${quota} active jobs.`;
+    await sender.sendMessages({
+      body: {
+        jobId: job.jobId,
+        tenantId,
+        status: "rejected",
+        completedAt: new Date().toISOString(),
+        error: {
+          code: "TenantQuotaExceeded",
+          message: errorMessage,
+          quota,
+          active: current,
+        },
+      },
+      contentType: "application/json",
+    });
+    await receiver.completeMessage(message);
+    trackEvent("reasoning.job.rejected", {
+      tenantId,
+      jobId: job.jobId,
+      quota: quota.toString(),
+    });
+    await emitUsageEvent({ tenantId, type: "rejected" });
+    return;
+  }
+
+  updateTenantCount(tenantId, 1);
+  await emitUsageEvent({ tenantId, type: "started" });
+  trackEvent("reasoning.job.started", { tenantId, jobId: job.jobId });
+
+  const startedAt = Date.now();
+  console.log(`Processing job ${job.jobId}`);
+  try {
+    const result = await runPipeline(job);
+    await sender.sendMessages({
+      body: {
+        jobId: job.jobId,
+        tenantId,
+        completedAt: new Date().toISOString(),
+        status: "completed",
+        result,
+      },
+      contentType: "application/json",
+    });
+    await receiver.completeMessage(message);
+    trackEvent("reasoning.job.completed", { tenantId, jobId: job.jobId });
+    trackMetric("reasoning.job.duration_ms", Date.now() - startedAt, { tenantId });
+    await emitUsageEvent({ tenantId, type: "completed" });
+  } catch (error) {
+    console.error(`Job ${job.jobId} failed`, error);
+    await receiver.deadLetterMessage(message, {
+      deadLetterReason: "PipelineFailure",
+      deadLetterErrorDescription: (error as Error).message,
+    });
+    trackEvent("reasoning.job.failed", { tenantId, jobId: job.jobId });
+    await emitUsageEvent({ tenantId, type: "failed" });
+  } finally {
+    updateTenantCount(tenantId, -1);
+  }
+};
+
+const enqueueMessage = (
+  message: ServiceBusReceivedMessage,
+  receiver: ReturnType<ServiceBusClient["createReceiver"]>,
+) => {
+  const queueDepth = pendingMessages.length + activeWorkers;
+  if (queueDepth >= maxQueueDepth) {
+    trackEvent("reasoning.queue.backpressure", { queueDepth: queueDepth.toString() });
+    return receiver.abandonMessage(message);
+  }
+  pendingMessages.push(message);
+  trackMetric("reasoning.queue.depth", pendingMessages.length + activeWorkers);
+  return Promise.resolve();
+};
+
+const drainQueue = (
+  receiver: ReturnType<ServiceBusClient["createReceiver"]>,
+  sender: ReturnType<ServiceBusClient["createSender"]>,
+) => {
+  while (activeWorkers < maxConcurrentCalls && pendingMessages.length > 0) {
+    const next = pendingMessages.shift();
+    if (!next) {
+      break;
+    }
+    activeWorkers += 1;
+    void processQueuedMessage(next, receiver, sender).finally(() => {
+      activeWorkers = Math.max(0, activeWorkers - 1);
+      trackMetric("reasoning.queue.depth", pendingMessages.length + activeWorkers);
+      drainQueue(receiver, sender);
+    });
+  }
+};
+
 const main = async () => {
   console.log("Reasoning worker starting...");
   const client = new ServiceBusClient(serviceBusConnectionString);
@@ -452,33 +634,18 @@ const main = async () => {
   const subscription = receiver.subscribe(
     {
       processMessage: async (message) => {
-        const job = decodeJob(message);
-        console.log(`Processing job ${job.jobId}`);
-        try {
-          const result = await runPipeline(job);
-          await sender.sendMessages({
-            body: {
-              jobId: job.jobId,
-              completedAt: new Date().toISOString(),
-              result,
-            },
-            contentType: "application/json",
-          });
-          await receiver.completeMessage(message);
-        } catch (error) {
-          console.error(`Job ${job.jobId} failed`, error);
-          await receiver.deadLetterMessage(message, {
-            deadLetterReason: "PipelineFailure",
-            deadLetterErrorDescription: (error as Error).message,
-          });
-        }
+        await enqueueMessage(message, receiver);
+        drainQueue(receiver, sender);
       },
       processError: async (args) => {
         console.error("Service Bus processing error", args.error);
+        if (telemetry) {
+          telemetry.trackException({ exception: args.error });
+        }
       },
     },
     {
-      maxConcurrentCalls,
+      maxConcurrentCalls: 1,
     },
   );
 
